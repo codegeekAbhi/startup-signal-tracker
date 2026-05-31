@@ -1,6 +1,6 @@
 streamlit==1.45.1
 groq==1.2.0
-feedparser==6.0.12
+feedparser
 gspread==6.2.1
 google-auth==2.53.0
 pandas==2.2.3
