@@ -4,6 +4,7 @@ AI-powered pipeline that monitors RSS feeds for newly funded startups and scores
 
 ## Live App
 https://streamlit-blank--ahmsingh.replit.app
+
 https://startup-signal-tracker-5qh32zrptrcgkrztqskopw.streamlit.app/
 
 ## Stack
