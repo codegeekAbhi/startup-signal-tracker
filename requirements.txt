@@ -1,0 +1,9 @@
+streamlit==1.45.1
+crewai==1.14.5
+crewai-tools==1.14.5
+groq==1.2.0
+feedparser==6.0.12
+gspread==6.2.1
+google-auth==2.53.0
+pandas==2.2.3
+litellm==1.85.0
