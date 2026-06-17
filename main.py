@@ -152,6 +152,7 @@ Summary: {entry['summary'][:150]}
             "sector": "Unknown",
             "key_people": "Unknown",
         }
+
 # ── Step 2: Score PM fit ──────────────────────────────────────────────────────────
 def score_pm_fit(client, info, entry):
     prompt = f"""You are a PM job seeker evaluating startup funding news for outreach opportunities.
