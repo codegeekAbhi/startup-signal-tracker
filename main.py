@@ -95,19 +95,16 @@ def fetch_rss_entries():
                 if not title or title in seen_titles:
                     continue
 
-                # Blocklist check
                 title_lower = title.lower()
                 if any(b in title_lower for b in BLOCKLIST):
                     continue
 
-                # Date filter
                 published = e.get("published_parsed") or e.get("updated_parsed")
                 if published:
                     pub_dt = datetime(*published[:6])
                     if pub_dt < cutoff:
                         continue
 
-                # Keyword filter — title only
                 strong_hit = any(k in title_lower for k in STRONG_KEYWORDS)
                 weak_hits  = sum(1 for k in WEAK_KEYWORDS if k in title_lower)
                 if not strong_hit and weak_hits < 2:
@@ -154,10 +151,10 @@ Return this exact JSON structure:
             temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
-        # Strip markdown fences if present
         raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
         return json.loads(raw)
-    except Exception:
+    except Exception as e:
+        st.error(f"EXTRACTION ERROR for '{entry['title'][:50]}...': {repr(e)}")
         return {
             "company": "Unknown",
             "amount": "Unknown",
@@ -195,7 +192,8 @@ Return ONLY valid JSON. No markdown, no explanation.
         raw = response.choices[0].message.content.strip()
         raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
         return json.loads(raw)
-    except Exception:
+    except Exception as e:
+        st.error(f"SCORING ERROR for '{info.get('company','?')}': {repr(e)}")
         return {
             "fit_score": 5,
             "action": "monitor",
@@ -251,11 +249,9 @@ def run_pipeline():
 
         progress = st.progress(0)
         for i, entry in enumerate(entries):
-            # Extract
             info = extract_startup_info(client, entry)
-            time.sleep(0.5)  # rate limit buffer
+            time.sleep(0.5)
 
-            # Score
             score = score_pm_fit(client, info, entry)
             time.sleep(0.5)
 
@@ -368,7 +364,6 @@ if sheets_btn and results:
         st.success("✅ Exported to Google Sheets")
 
 if results:
-    # Apply filters
     filtered = results
     if filter_action:
         filtered = [r for r in filtered if any(a in r["action"].lower() for a in filter_action)]
@@ -377,7 +372,6 @@ if results:
 
     st.markdown(f"### Showing {len(filtered)} startups")
 
-    # Tabs
     tab1, tab2 = st.tabs(["📋 Cards", "📊 Table"])
 
     with tab1:
