@@ -241,12 +241,12 @@ def run_pipeline():
             info = extract_startup_info(client, entry)
             time.sleep(0.5)
 
-            score = score_pm_fit(client, info, entry)
-            time.sleep(0.5)
-
             if info.get("company", "Unknown") == "Unknown":
                 progress.progress((i + 1) / len(entries))
                 continue
+
+            score = score_pm_fit(client, info, entry)
+            time.sleep(0.5)
 
             results.append({
                 "company":    info.get("company", "Unknown"),
