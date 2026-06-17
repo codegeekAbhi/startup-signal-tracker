@@ -128,26 +128,16 @@ def get_groq_client():
 
 # ── Step 1: Extract startup info ─────────────────────────────────────────────────
 def extract_startup_info(client, entry):
-    prompt = f"""Extract startup funding information from this article title and summary.
-Return ONLY valid JSON. No markdown, no explanation.
-
+    prompt = f"""Extract startup funding info as JSON only, no markdown:
 Title: {entry['title']}
-Summary: {entry['summary']}
-
-Return this exact JSON structure:
-{{
-  "company": "company name or Unknown",
-  "amount": "funding amount or Unknown",
-  "stage": "Seed/Series A/Series B/Series C/Growth/Unknown",
-  "sector": "industry sector",
-  "key_people": "founder or CEO name if mentioned, else Unknown"
-}}"""
+Summary: {entry['summary'][:150]}
+{{"company":"name or Unknown","amount":"$X or Unknown","stage":"Seed/Series A/B/C/Unknown","sector":"sector","key_people":"name or Unknown"}}"""
 
     try:
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
+            max_tokens=150,
             temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
@@ -162,7 +152,6 @@ Return this exact JSON structure:
             "sector": "Unknown",
             "key_people": "Unknown",
         }
-
 # ── Step 2: Score PM fit ──────────────────────────────────────────────────────────
 def score_pm_fit(client, info, entry):
     prompt = f"""You are a PM job seeker evaluating startup funding news for outreach opportunities.
