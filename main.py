@@ -12,11 +12,11 @@ import litellm
 import feedparser
 import pandas as pd
 import gspread
+import streamlit as st
 
 from datetime import datetime, timezone, timedelta
 from google.oauth2.service_account import Credentials
 from crewai import Agent, Task, Crew, Process, LLM
-import streamlit as st
 
 
 # ============================================
@@ -128,8 +128,17 @@ def build_agents():
 
     researcher = Agent(
         role="Startup Data Researcher",
-        goal="Extract structured data: company name, funding amount, stage, and sector.",
-        backstory="Precise data extractor. Returns clean structured info, uses Unknown when data unavailable.",
+        goal=(
+            "Extract precise structured data from each startup funding entry. "
+            "You must extract the EXACT company name as written in the headline, not a description. "
+            "Also extract investor/VC names and any founder, CEO, or CTO names mentioned."
+        ),
+        backstory=(
+            "You are a precise data extractor who reads startup funding headlines carefully. "
+            "You never replace a company name with a generic description. "
+            "If the headline says 'Acme raises $10M', the company is Acme, not 'a startup'. "
+            "You also identify which VC firms or investors backed the round, and any key people mentioned."
+        ),
         llm=llm,
         verbose=False,
         allow_delegation=False
@@ -159,36 +168,66 @@ def build_tasks(scout, researcher, analyst):
             "- https://techcrunch.com/category/startups/feed/\n"
             "- https://venturebeat.com/feed/\n\n"
             "Filter by funding keywords, current month and last month, deduplicate, exclude noise. "
-            "Return list with title, summary, published date, and link. "
-            "Sort entries by published date, newest first."
+            "Return each entry with: title (exact headline text), summary, published date, and link. "
+            "Sort entries by published date, newest first. "
+            "Do NOT paraphrase or rewrite the title. Return it exactly as published."
         ),
-        expected_output="List of dicts with title, summary, published, link sorted by date descending",
+        expected_output="List of dicts with title (exact), summary, published, link sorted by date descending",
         agent=scout
     )
 
     researcher_task = Task(
         description=(
-            "From the Scout's entries extract: "
-            "company, amount, stage, sector, is_startup, date (YYYY-MM-DD format from published field). "
-            "Use Unknown when unavailable. Return only startups."
+            "You will receive a list of startup funding headlines and summaries from the Scout. "
+            "For each entry extract the following fields:\n\n"
+            "- company: the EXACT startup name from the headline. "
+            "For example if the title is 'Acme AI raises $17M Series A', company is 'Acme AI'. "
+            "NEVER use generic descriptions like 'AI startup' or 'mental health platform' as the company name.\n"
+            "- amount: funding amount with $ sign, e.g. '$17M'. Use 'Unknown' if not stated.\n"
+            "- stage: Seed, Series A, Series B, etc. Use 'Unknown' if not stated.\n"
+            "- sector: industry sector, e.g. AI, FinTech, LegalTech, SaaS, HealthTech. Use 'Unknown' if unclear.\n"
+            "- investors: names of VC firms or investors mentioned, e.g. 'a16z, YC'. Use 'Not mentioned' if none.\n"
+            "- key_people: names and roles of founders, CEOs, CTOs mentioned, e.g. 'Jane Smith (CEO)'. Use 'Not mentioned' if none.\n"
+            "- date: published date in YYYY-MM-DD format.\n"
+            "- is_startup: true if this is a startup raise, false if it is a VC fund or large enterprise.\n\n"
+            "Return only entries where is_startup is true."
         ),
-        expected_output="List of dicts with company, amount, stage, sector, date, title, link",
+        expected_output=(
+            "List of dicts with company (exact name), amount, stage, sector, "
+            "investors, key_people, date, title, link"
+        ),
         agent=researcher,
         context=[scout_task]
     )
 
     analyst_task = Task(
         description=(
-            "Score each startup 1-10 for PM fit. "
-            "Provide fit_score as integer, reason as string, action as one of: reach out now, monitor, skip. "
-            "Include the date field (YYYY-MM-DD) from the Researcher output for each entry. "
+            "You will receive a list of structured startup entries from the Researcher. "
+            "Score each startup 1-10 for PM fit based on this candidate profile:\n"
+            "- 7+ years at Amazon, Deloitte, TCS\n"
+            "- Strong in B2B SaaS, marketplace, AI-powered products\n"
+            "- MBA UC Davis 2026\n"
+            "- Targeting Series A and Series B\n"
+            "- Low interest in Hardware and pure consumer social\n\n"
+            "For each startup return these fields:\n"
+            "- company: copy EXACT company name from Researcher output, never use a generic description\n"
+            "- amount: copy exactly from Researcher\n"
+            "- stage: copy exactly from Researcher\n"
+            "- sector: copy exactly from Researcher\n"
+            "- investors: copy exactly from Researcher\n"
+            "- key_people: copy exactly from Researcher\n"
+            "- date: copy exactly from Researcher\n"
+            "- fit_score: integer 1-10\n"
+            "- reason: one sentence explaining the score\n"
+            "- action: one of 'reach out now' (8-10), 'monitor' (5-7), 'skip' (1-4)\n\n"
             "Return ONLY a valid JSON array. No explanation, no markdown, no code blocks. "
-            "Sort by date descending first, then fit_score descending within the same date.\n"
-            'Example format:\n'
-            '[{"company": "Acme", "amount": "$10M", "stage": "Series A", "sector": "AI", '
-            '"date": "2026-05-20", "fit_score": 9, "reason": "Strong AI fit", "action": "reach out now"}]'
+            "Sort by date descending, then fit_score descending within the same date.\n"
+            "Example:\n"
+            '[{"company": "Status AI", "amount": "$17M", "stage": "Series A", "sector": "AI", '
+            '"investors": "a16z, YC", "key_people": "Jane Smith (CEO)", "date": "2026-05-20", '
+            '"fit_score": 9, "reason": "Strong AI B2B fit at Series A.", "action": "reach out now"}]'
         ),
-        expected_output="Valid JSON array sorted by date descending then fit_score descending",
+        expected_output="Valid JSON array sorted by date desc then fit_score desc",
         agent=analyst,
         context=[researcher_task]
     )
@@ -263,8 +302,8 @@ def export_to_sheets(df_final):
         sheet = client.open(SHEET_NAME).sheet1
 
         headers = [
-            "run_timestamp", "date", "company", "amount",
-            "stage", "sector", "fit_score", "action", "reason"
+            "run_timestamp", "date", "company", "amount", "stage",
+            "sector", "investors", "key_people", "fit_score", "action", "reason"
         ]
         existing = sheet.get_all_values()
         if len(existing) == 0:
@@ -276,13 +315,15 @@ def export_to_sheets(df_final):
             sheet.append_row([
                 run_time,
                 row.get("date", "Unknown"),
-                row["company"],
-                row["amount"],
-                row["stage"],
-                row["sector"],
-                int(row["fit_score"]),
-                row["action"],
-                row["reason"]
+                row.get("company", "Unknown"),
+                row.get("amount", "Unknown"),
+                row.get("stage", "Unknown"),
+                row.get("sector", "Unknown"),
+                row.get("investors", "Not mentioned"),
+                row.get("key_people", "Not mentioned"),
+                int(row.get("fit_score", 0)),
+                row.get("action", "skip"),
+                row.get("reason", "")
             ])
 
         return True, f"{len(df_final)} rows written at {run_time}"
@@ -301,6 +342,13 @@ st.markdown("Multi-agent pipeline: RSS - Extract - Score PM Fit - Google Sheets"
 
 st.sidebar.header("Configuration")
 st.sidebar.markdown("**Candidate Profile**")
+st.sidebar.markdown("**Abhishek Singh**")
+st.sidebar.markdown(
+    "[LinkedIn](https://www.linkedin.com/in/abhishek-singh-davis) | "
+    "[GitHub](https://github.com/codegeekAbhi) | "
+    "[Portfolio](https://www.notion.so/Hi-I-m-Abhishek-Singh-21b6d321e30b804eab8ad37f2783be09)"
+)
+st.sidebar.markdown("---")
 st.sidebar.markdown("- 7+ years: Amazon, Deloitte, TCS")
 st.sidebar.markdown("- B2B SaaS, AI, Marketplace")
 st.sidebar.markdown("- MBA UC Davis 2026")
@@ -353,29 +401,31 @@ if run_button:
         st.subheader("Ranked Startup List")
 
         for _, row in df_final.iterrows():
-            if row["action"] == "reach out now":
-                color = "green"
+            action = row.get("action", "skip")
+            if action == "reach out now":
                 icon = "HIGH"
-            elif row["action"] == "monitor":
-                color = "orange"
+            elif action == "monitor":
                 icon = "MED"
             else:
-                color = "red"
                 icon = "LOW"
 
             label = (
                 f"[{icon}] {row.get('date', 'N/A')} - "
-                f"{row['company']} - Score: {row['fit_score']}/10 - "
-                f"{row['action'].upper()}"
+                f"{row.get('company', 'Unknown')} - "
+                f"Score: {row.get('fit_score', 0)}/10 - "
+                f"{action.upper()}"
             )
 
             with st.expander(label):
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Amount", row["amount"])
-                col2.metric("Stage", row["stage"])
-                col3.metric("Sector", row["sector"])
+                col1.metric("Amount", row.get("amount", "Unknown"))
+                col2.metric("Stage", row.get("stage", "Unknown"))
+                col3.metric("Sector", row.get("sector", "Unknown"))
                 col4.metric("Date", row.get("date", "N/A"))
-                st.markdown(f"**Reason:** {row['reason']}")
+
+                st.markdown(f"**Investors / VC:** {row.get('investors', 'Not mentioned')}")
+                st.markdown(f"**Key People:** {row.get('key_people', 'Not mentioned')}")
+                st.markdown(f"**Reason:** {row.get('reason', '')}")
 
     except Exception as e:
         status.error(f"Error: {str(e)}")
