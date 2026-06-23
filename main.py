@@ -263,28 +263,52 @@ def parse_result(result):
         return None, raw
 
     json_str = match.group(0)
-    json_str = json_str.replace("'", '"')
     json_str = re.sub(r',\s*}', '}', json_str)
     json_str = re.sub(r',\s*]', ']', json_str)
+    json_str = re.sub(r'[\x00-\x1f\x7f]', ' ', json_str)
+    json_str = json_str.replace('\u201c', '"').replace('\u201d', '"')
+    json_str = json_str.replace('\u2018', "'").replace('\u2019', "'")
+
+    data = None
 
     try:
         data = json.loads(json_str)
-        df_final = pd.DataFrame(data)
+    except json.JSONDecodeError:
+        objects = re.findall(r'\{[^{}]+\}', json_str, re.DOTALL)
+        data = []
+        for obj in objects:
+            try:
+                parsed = json.loads(obj)
+                data.append(parsed)
+            except json.JSONDecodeError:
+                obj_clean = re.sub(
+                    r'("reason"\s*:\s*")(.*?)("(?:\s*,|\s*}))',
+                    lambda m: m.group(1) + m.group(2).replace('"', "'") + m.group(3),
+                    obj,
+                    flags=re.DOTALL
+                )
+                try:
+                    parsed = json.loads(obj_clean)
+                    data.append(parsed)
+                except json.JSONDecodeError:
+                    continue
 
-        if "date" in df_final.columns:
-            df_final["date"] = pd.to_datetime(df_final["date"], errors="coerce")
-            df_final = df_final.sort_values(
-                ["date", "fit_score"],
-                ascending=[False, False]
-            ).reset_index(drop=True)
-            df_final["date"] = df_final["date"].dt.strftime("%Y-%m-%d")
-        else:
-            df_final = df_final.sort_values("fit_score", ascending=False).reset_index(drop=True)
+    if not data:
+        return None, f"Could not parse any valid entries.\n\nRaw:\n{raw}"
 
-        return df_final, None
+    df_final = pd.DataFrame(data)
 
-    except json.JSONDecodeError as e:
-        return None, f"JSON parse error: {e}\n\nRaw output:\n{raw}"
+    if "date" in df_final.columns:
+        df_final["date"] = pd.to_datetime(df_final["date"], errors="coerce")
+        df_final = df_final.sort_values(
+            ["date", "fit_score"],
+            ascending=[False, False]
+        ).reset_index(drop=True)
+        df_final["date"] = df_final["date"].dt.strftime("%Y-%m-%d")
+    else:
+        df_final = df_final.sort_values("fit_score", ascending=False).reset_index(drop=True)
+
+    return df_final, None
 
 
 def export_to_sheets(df_final):
