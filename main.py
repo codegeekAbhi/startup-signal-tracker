@@ -1,377 +1,382 @@
-import streamlit as st
-import feedparser
+# ============================================
+# Startup Signal Tracker - CrewAI Pipeline
+# Phase 1: RSS Fetch - Extract - Score
+# ============================================
+
+import os
 import json
 import re
-import time
+import threading
+import email.utils
+import litellm
+import feedparser
 import pandas as pd
-from datetime import datetime, timedelta
-from groq import Groq
 import gspread
-from google.oauth2.service_account import Credentials
 
-# ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Startup Signal Tracker",
-    page_icon="🚀",
-    layout="wide",
+from datetime import datetime, timezone, timedelta
+from google.oauth2.service_account import Credentials
+from crewai import Agent, Task, Crew, Process, LLM
+import streamlit as st
+
+
+# ============================================
+# CONFIG
+# ============================================
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GOOGLE_CREDS = os.environ.get("GOOGLE_CREDS", "")
+SHEET_NAME = "Startup Signal Tracker"
+
+RSS_FEEDS = {
+    "TechCrunch Venture": "https://techcrunch.com/category/venture/feed/",
+    "TechCrunch Startups": "https://techcrunch.com/category/startups/feed/",
+    "VentureBeat": "https://venturebeat.com/feed/",
+}
+
+FUNDING_KEYWORDS = [
+    "raises", "raised", "funding", "seed", "series a", "series b",
+    "backed", "million", "launches", "announces"
+]
+
+EXCLUDE_PHRASES = [
+    "applications close", "third fund", "closed a fund",
+    "retail venture ipo", "doubles valuation", "disrupt 2026",
+    "50% off", "get ready for", "hottest place", "nvidia has",
+    "google's new", "google says", "google just", "google unveils",
+    "openai co-founder", "anthropic warns", "apple unveils",
+    "stage at techcrunch",
+]
+
+
+# ============================================
+# LLM SETUP
+# ============================================
+
+os.environ["LITELLM_CACHE"] = "False"
+os.environ["LITELLM_ENABLE_CACHING"] = "False"
+os.environ["GROQ_CACHE"] = "False"
+litellm.cache = None
+litellm.caching = False
+
+llm = LLM(
+    model="llama-3.3-70b-versatile",
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
 )
 
-# ── Styling ─────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=DM+Sans:wght@400;500&display=swap');
 
-    html, body, [class*="css"] {
-        font-family: 'DM Sans', sans-serif;
-    }
-    h1, h2, h3 {
-        font-family: 'Playfair Display', serif;
-    }
-    .main { background-color: #f0f4ff; }
-    section[data-testid="stSidebar"] { background-color: #1d3a8a; color: white; }
-    section[data-testid="stSidebar"] * { color: white !important; }
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
 
-    .card {
-        background: white;
-        border-radius: 12px;
-        padding: 1.2rem 1.5rem;
-        margin-bottom: 1rem;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.07);
-        border-left: 5px solid #ccc;
-    }
-    .card.green  { border-left-color: #22c55e; }
-    .card.yellow { border-left-color: #f59e0b; }
-    .card.red    { border-left-color: #ef4444; }
+def parse_date(date_str):
+    try:
+        return email.utils.parsedate_to_datetime(date_str).replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
-    .badge {
-        display: inline-block;
-        padding: 2px 10px;
-        border-radius: 999px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        margin-right: 6px;
-    }
-    .badge-green  { background: #dcfce7; color: #166534; }
-    .badge-yellow { background: #fef9c3; color: #854d0e; }
-    .badge-red    { background: #fee2e2; color: #991b1b; }
-    .badge-blue   { background: #dbeafe; color: #1e40af; }
-    .badge-gray   { background: #f3f4f6; color: #374151; }
-</style>
-""", unsafe_allow_html=True)
 
-# ── Constants ────────────────────────────────────────────────────────────────────
-RSS_FEEDS = [
-    "https://techcrunch.com/category/venture/feed/",
-    "https://techcrunch.com/startups/feed/",
-    "https://venturebeat.com/feed/",
-]
+def has_funding_signal(title):
+    t = title.lower()
+    return any(kw in t for kw in FUNDING_KEYWORDS)
 
-STRONG_KEYWORDS = [
-    "funding", "raises", "seed", "series a", "series b", "series c",
-    "venture", "investment", "backed", "million", "billion", "round",
-]
-WEAK_KEYWORDS = [
-    "startup", "founded", "launch", "growth", "expansion",
-    "AI", "SaaS", "fintech", "healthtech", "B2B",
-]
-BLOCKLIST = [
-    "career", "job", "hiring", "podcast", "event", "webinar",
-    "obituary", "opinion", "review", "how to", "tutorial",
-]
 
-DAYS_WINDOW = 7
+def not_noise(title):
+    t = title.lower()
+    return not any(phrase in t for phrase in EXCLUDE_PHRASES)
 
-# ── RSS Fetch ─────────────────────────────────────────────────────────────────────
-def fetch_rss_entries():
-    cutoff = datetime.utcnow() - timedelta(days=DAYS_WINDOW)
-    seen_titles = set()
-    entries = []
 
-    for url in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(url)
-            for e in feed.entries:
-                title = e.get("title", "").strip()
-                if not title or title in seen_titles:
-                    continue
+def fetch_and_filter_rss():
+    raw_entries = []
+    for source, url in RSS_FEEDS.items():
+        feed = feedparser.parse(url)
+        for entry in feed.entries:
+            raw_entries.append({
+                "source": source,
+                "title": entry.get("title", ""),
+                "link": entry.get("link", ""),
+                "summary": entry.get("summary", ""),
+                "published": entry.get("published", ""),
+            })
 
-                title_lower = title.lower()
-                if any(b in title_lower for b in BLOCKLIST):
-                    continue
+    df = pd.DataFrame(raw_entries)
+    df = df.drop_duplicates(subset="title")
+    df["parsed_date"] = df["published"].apply(parse_date)
 
-                published = e.get("published_parsed") or e.get("updated_parsed")
-                if published:
-                    pub_dt = datetime(*published[:6])
-                    if pub_dt < cutoff:
-                        continue
+    now = datetime.now(timezone.utc)
+    first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    first_of_last_month = (first_of_this_month - timedelta(days=1)).replace(day=1)
 
-                strong_hit = any(k in title_lower for k in STRONG_KEYWORDS)
-                weak_hits  = sum(1 for k in WEAK_KEYWORDS if k in title_lower)
-                if not strong_hit and weak_hits < 2:
-                    continue
+    df = df[df["parsed_date"].notna() & (df["parsed_date"] >= first_of_last_month)]
+    df = df[df["title"].apply(has_funding_signal)]
+    df = df[df["title"].apply(not_noise)]
+    df = df.sort_values("parsed_date", ascending=False).reset_index(drop=True)
+    df["date"] = df["parsed_date"].dt.strftime("%Y-%m-%d")
 
-                seen_titles.add(title)
-                entries.append({
-                    "title":   title,
-                    "summary": (e.get("summary", "") or "")[:300],
-                    "link":    e.get("link", ""),
-                })
-        except Exception:
-            continue
+    return df, first_of_last_month, now
 
-    return entries
 
-# ── Groq client ──────────────────────────────────────────────────────────────────
-@st.cache_resource
-def get_groq_client():
-    return Groq(api_key=st.secrets["GROQ_API_KEY"])
+def build_agents():
+    scout = Agent(
+        role="Startup Signal Scout",
+        goal="Fetch RSS feeds, filter for recently funded startups, return clean deduplicated entries from the current and last month.",
+        backstory="Expert at monitoring startup news, spotting genuine funding announcements and filtering noise.",
+        llm=llm,
+        verbose=False,
+        allow_delegation=False
+    )
 
-# ── Step 1: Extract startup info ─────────────────────────────────────────────────
-def extract_startup_info(client, entry):
-    prompt = f"""Extract startup funding info as JSON only, no markdown:
-Title: {entry['title']}
-Summary: {entry['summary'][:150]}
-{{"company":"name or Unknown","amount":"$X or Unknown","stage":"Seed/Series A/B/C/Unknown","sector":"sector","key_people":"name or Unknown"}}"""
+    researcher = Agent(
+        role="Startup Data Researcher",
+        goal="Extract structured data: company name, funding amount, stage, and sector.",
+        backstory="Precise data extractor. Returns clean structured info, uses Unknown when data unavailable.",
+        llm=llm,
+        verbose=False,
+        allow_delegation=False
+    )
+
+    analyst = Agent(
+        role="PM Fit Analyst",
+        goal="Score each startup 1-10 for PM fit and recommend: reach out now, monitor, or skip.",
+        backstory=(
+            "Evaluates startups for a senior PM candidate: 7+ years at Amazon/Deloitte/TCS, "
+            "B2B SaaS and AI experience, MBA UC Davis 2026, targeting Series A/B. "
+            "Low fit for Hardware and consumer social."
+        ),
+        llm=llm,
+        verbose=False,
+        allow_delegation=False
+    )
+
+    return scout, researcher, analyst
+
+
+def build_tasks(scout, researcher, analyst):
+    scout_task = Task(
+        description=(
+            "Fetch RSS feeds from:\n"
+            "- https://techcrunch.com/feed/\n"
+            "- https://techcrunch.com/category/startups/feed/\n"
+            "- https://venturebeat.com/feed/\n\n"
+            "Filter by funding keywords, current month and last month, deduplicate, exclude noise. "
+            "Return list with title, summary, published date, and link. "
+            "Sort entries by published date, newest first."
+        ),
+        expected_output="List of dicts with title, summary, published, link sorted by date descending",
+        agent=scout
+    )
+
+    researcher_task = Task(
+        description=(
+            "From the Scout's entries extract: "
+            "company, amount, stage, sector, is_startup, date (YYYY-MM-DD format from published field). "
+            "Use Unknown when unavailable. Return only startups."
+        ),
+        expected_output="List of dicts with company, amount, stage, sector, date, title, link",
+        agent=researcher,
+        context=[scout_task]
+    )
+
+    analyst_task = Task(
+        description=(
+            "Score each startup 1-10 for PM fit. "
+            "Provide fit_score as integer, reason as string, action as one of: reach out now, monitor, skip. "
+            "Include the date field (YYYY-MM-DD) from the Researcher output for each entry. "
+            "Return ONLY a valid JSON array. No explanation, no markdown, no code blocks. "
+            "Sort by date descending first, then fit_score descending within the same date.\n"
+            'Example format:\n'
+            '[{"company": "Acme", "amount": "$10M", "stage": "Series A", "sector": "AI", '
+            '"date": "2026-05-20", "fit_score": 9, "reason": "Strong AI fit", "action": "reach out now"}]'
+        ),
+        expected_output="Valid JSON array sorted by date descending then fit_score descending",
+        agent=analyst,
+        context=[researcher_task]
+    )
+
+    return scout_task, researcher_task, analyst_task
+
+
+def run_crew(scout_task, researcher_task, analyst_task, scout, researcher, analyst):
+    crew = Crew(
+        agents=[scout, researcher, analyst],
+        tasks=[scout_task, researcher_task, analyst_task],
+        process=Process.sequential,
+        verbose=False
+    )
+
+    result_container = {}
+
+    def kickoff():
+        result_container["result"] = crew.kickoff()
+
+    thread = threading.Thread(target=kickoff)
+    thread.start()
+    thread.join(timeout=300)
+
+    return result_container.get("result", None)
+
+
+def parse_result(result):
+    raw = str(result)
+    match = re.search(r'\[.*\]', raw, re.DOTALL)
+
+    if not match:
+        return None, raw
+
+    json_str = match.group(0)
+    json_str = json_str.replace("'", '"')
+    json_str = re.sub(r',\s*}', '}', json_str)
+    json_str = re.sub(r',\s*]', ']', json_str)
 
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
-            temperature=0.1,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
-        return json.loads(raw)
-    except Exception as e:
-        st.error(f"EXTRACTION ERROR for '{entry['title'][:50]}...': {repr(e)}")
-        return {
-            "company": "Unknown",
-            "amount": "Unknown",
-            "stage": "Unknown",
-            "sector": "Unknown",
-            "key_people": "Unknown",
-        }
+        data = json.loads(json_str)
+        df_final = pd.DataFrame(data)
 
-# ── Step 2: Score PM fit ──────────────────────────────────────────────────────────
-def score_pm_fit(client, info, entry):
-    prompt = f"""You are a PM job seeker evaluating startup funding news for outreach opportunities.
-Score this startup's fit for a Senior PM role. Consider: stage (earlier = more opportunity), 
-AI/SaaS/B2B sectors score higher, larger rounds mean more hiring budget.
+        if "date" in df_final.columns:
+            df_final["date"] = pd.to_datetime(df_final["date"], errors="coerce")
+            df_final = df_final.sort_values(
+                ["date", "fit_score"],
+                ascending=[False, False]
+            ).reset_index(drop=True)
+            df_final["date"] = df_final["date"].dt.strftime("%Y-%m-%d")
+        else:
+            df_final = df_final.sort_values("fit_score", ascending=False).reset_index(drop=True)
 
-Startup: {info['company']}
-Amount: {info['amount']}
-Stage: {info['stage']}
-Sector: {info['sector']}
-Title: {entry['title']}
+        return df_final, None
 
-Return ONLY valid JSON. No markdown, no explanation.
-{{
-  "fit_score": <integer 1-10>,
-  "action": "reach out now / monitor / skip",
-  "reason": "one sentence explanation"
-}}"""
+    except json.JSONDecodeError as e:
+        return None, f"JSON parse error: {e}\n\nRaw output:\n{raw}"
+
+
+def export_to_sheets(df_final):
+    if not GOOGLE_CREDS:
+        return False, "GOOGLE_CREDS secret not set."
 
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
-            temperature=0.2,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
-        return json.loads(raw)
-    except Exception as e:
-        st.error(f"SCORING ERROR for '{info.get('company','?')}': {repr(e)}")
-        return {
-            "fit_score": 5,
-            "action": "monitor",
-            "reason": "Could not score automatically.",
-        }
-
-# ── Google Sheets export ──────────────────────────────────────────────────────────
-def export_to_sheets(df):
-    try:
-        creds_dict = json.loads(st.secrets["GOOGLE_CREDS"])
+        creds_data = json.loads(GOOGLE_CREDS)
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/drive"
         ]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open("Startup Signal Tracker")
-        ws = sh.sheet1
+        creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
+        client = gspread.authorize(creds)
+        sheet = client.open(SHEET_NAME).sheet1
 
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        for _, row in df.iterrows():
-            ws.append_row([
-                timestamp,
-                row.get("company", ""),
-                row.get("amount", ""),
-                row.get("stage", ""),
-                row.get("sector", ""),
-                row.get("fit_score", ""),
-                row.get("action", ""),
-                row.get("reason", ""),
-                row.get("key_people", ""),
-                row.get("link", ""),
+        headers = [
+            "run_timestamp", "date", "company", "amount",
+            "stage", "sector", "fit_score", "action", "reason"
+        ]
+        existing = sheet.get_all_values()
+        if len(existing) == 0:
+            sheet.append_row(headers)
+
+        run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        for _, row in df_final.iterrows():
+            sheet.append_row([
+                run_time,
+                row.get("date", "Unknown"),
+                row["company"],
+                row["amount"],
+                row["stage"],
+                row["sector"],
+                int(row["fit_score"]),
+                row["action"],
+                row["reason"]
             ])
-        return True
+
+        return True, f"{len(df_final)} rows written at {run_time}"
+
     except Exception as e:
-        st.warning(f"Google Sheets export failed: {e}")
-        return False
+        return False, str(e)
 
-# ── Run pipeline ──────────────────────────────────────────────────────────────────
-def run_pipeline():
-    client = get_groq_client()
-    results = []
 
-    with st.status("🔍 Scanning RSS feeds...", expanded=True) as status:
-        entries = fetch_rss_entries()
-        st.write(f"Found **{len(entries)}** articles matching funding signals")
+# ============================================
+# STREAMLIT UI
+# ============================================
 
-        if not entries:
-            status.update(label="No articles found. Try again later.", state="error")
-            return []
+st.set_page_config(page_title="Startup Signal Tracker", page_icon="rocket", layout="wide")
+st.title("Startup Signal Tracker")
+st.markdown("Multi-agent pipeline: RSS - Extract - Score PM Fit - Google Sheets")
 
-        status.update(label="🤖 Extracting and scoring startups...")
+st.sidebar.header("Configuration")
+st.sidebar.markdown("**Candidate Profile**")
+st.sidebar.markdown("- 7+ years: Amazon, Deloitte, TCS")
+st.sidebar.markdown("- B2B SaaS, AI, Marketplace")
+st.sidebar.markdown("- MBA UC Davis 2026")
+st.sidebar.markdown("- Target: Series A/B")
+st.sidebar.markdown("- Date range: current month + last month")
 
-        progress = st.progress(0)
-        for i, entry in enumerate(entries):
-            info = extract_startup_info(client, entry)
-            time.sleep(0.5)
+run_button = st.sidebar.button("Run Signal Tracker", type="primary")
 
-            if info.get("company", "Unknown") == "Unknown":
-                progress.progress((i + 1) / len(entries))
-                continue
+status = st.empty()
+progress = st.progress(0)
 
-            score = score_pm_fit(client, info, entry)
-            time.sleep(0.5)
+if run_button:
+    try:
+        status.info("Setting up agents...")
+        progress.progress(10)
 
-            results.append({
-                "company":    info.get("company", "Unknown"),
-                "amount":     info.get("amount", "Unknown"),
-                "stage":      info.get("stage", "Unknown"),
-                "sector":     info.get("sector", "Unknown"),
-                "key_people": info.get("key_people", "Unknown"),
-                "fit_score":  score.get("fit_score", 5),
-                "action":     score.get("action", "monitor"),
-                "reason":     score.get("reason", ""),
-                "link":       entry.get("link", ""),
-                "title":      entry.get("title", ""),
-            })
-            progress.progress((i + 1) / len(entries))
+        scout, researcher, analyst = build_agents()
+        scout_task, researcher_task, analyst_task = build_tasks(scout, researcher, analyst)
 
-        status.update(label=f"✅ Done — {len(results)} startups scored", state="complete")
+        status.info("Running agents... this takes 2-3 minutes")
+        progress.progress(30)
 
-    return sorted(results, key=lambda x: x["fit_score"], reverse=True)
+        result = run_crew(scout_task, researcher_task, analyst_task, scout, researcher, analyst)
 
-# ── UI ─────────────────────────────────────────────────────────────────────────────
-def action_badge(action):
-    action = (action or "").lower()
-    if "reach" in action:
-        return '<span class="badge badge-green">🟢 Reach Out Now</span>', "green"
-    elif "monitor" in action:
-        return '<span class="badge badge-yellow">🟡 Monitor</span>', "yellow"
-    else:
-        return '<span class="badge badge-red">🔴 Skip</span>', "red"
+        if result is None:
+            status.error("Crew timed out or failed. Try again.")
+            st.stop()
 
-def render_card(r):
-    badge_html, color = action_badge(r["action"])
-    score = r.get("fit_score", 5)
-    st.markdown(f"""
-    <div class="card {color}">
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-            <h3 style="margin:0; font-size:1.1rem;">{r['company']}</h3>
-            {badge_html}
-            <span class="badge badge-blue">Fit Score: {score}/10</span>
-        </div>
-        <div style="margin-top:0.6rem; display:flex; flex-wrap:wrap; gap:6px;">
-            <span class="badge badge-gray">💰 {r['amount']}</span>
-            <span class="badge badge-gray">📊 {r['stage']}</span>
-            <span class="badge badge-gray">🏭 {r['sector']}</span>
-            <span class="badge badge-gray">👤 {r['key_people']}</span>
-        </div>
-        <p style="margin:0.6rem 0 0.3rem; font-size:0.9rem; color:#374151;">{r['reason']}</p>
-        <a href="{r['link']}" target="_blank" style="font-size:0.8rem; color:#1d3a8a;">📰 {r['title'][:80]}...</a>
-    </div>
-    """, unsafe_allow_html=True)
+        progress.progress(70)
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🚀 Startup Signal Tracker")
-    st.markdown("Monitors funding news and ranks startups by PM fit.")
-    st.markdown("---")
-    st.markdown("**Filters**")
-    filter_action = st.multiselect(
-        "Action",
-        ["reach out now", "monitor", "skip"],
-        default=["reach out now", "monitor"],
-    )
-    filter_stage = st.multiselect(
-        "Stage",
-        ["Seed", "Series A", "Series B", "Series C", "Growth", "Unknown"],
-        default=[],
-    )
-    st.markdown("---")
-    st.markdown("**Sources**")
-    for f in RSS_FEEDS:
-        domain = f.split("/")[2].replace("www.", "")
-        st.markdown(f"• {domain}")
+        df_final, error = parse_result(result)
 
-# ── Main ───────────────────────────────────────────────────────────────────────────
-st.markdown("# 🚀 Startup Signal Tracker")
-st.markdown("Funding signals → PM fit scores → ranked outreach list")
+        if df_final is None:
+            status.warning("Could not parse results. Raw output below:")
+            st.text(error)
+            st.stop()
 
-col1, col2, col3 = st.columns([1, 1, 2])
-with col1:
-    run_btn = st.button("▶ Run Pipeline", type="primary", use_container_width=True)
-with col2:
-    sheets_btn = st.button("📊 Export to Sheets", use_container_width=True)
+        status.info("Writing to Google Sheets...")
+        progress.progress(85)
 
-if run_btn:
-    results = run_pipeline()
-    st.session_state["results"] = results
+        success, msg = export_to_sheets(df_final)
+        if success:
+            st.sidebar.success(msg)
+        else:
+            st.sidebar.warning(f"Sheets export skipped: {msg}")
 
-    if results:
-        reach = sum(1 for r in results if "reach" in r["action"].lower())
-        monitor = sum(1 for r in results if "monitor" in r["action"].lower())
-        skip = sum(1 for r in results if "skip" in r["action"].lower())
+        progress.progress(100)
+        status.success(f"Done! {len(df_final)} startups ranked.")
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Startups", len(results))
-        m2.metric("🟢 Reach Out Now", reach)
-        m3.metric("🟡 Monitor", monitor)
-        m4.metric("🔴 Skip", skip)
+        st.subheader("Ranked Startup List")
 
-results = st.session_state.get("results", [])
+        for _, row in df_final.iterrows():
+            if row["action"] == "reach out now":
+                color = "green"
+                icon = "HIGH"
+            elif row["action"] == "monitor":
+                color = "orange"
+                icon = "MED"
+            else:
+                color = "red"
+                icon = "LOW"
 
-if sheets_btn and results:
-    df = pd.DataFrame(results)
-    ok = export_to_sheets(df)
-    if ok:
-        st.success("✅ Exported to Google Sheets")
+            label = (
+                f"[{icon}] {row.get('date', 'N/A')} - "
+                f"{row['company']} - Score: {row['fit_score']}/10 - "
+                f"{row['action'].upper()}"
+            )
 
-if results:
-    filtered = results
-    if filter_action:
-        filtered = [r for r in filtered if any(a in r["action"].lower() for a in filter_action)]
-    if filter_stage:
-        filtered = [r for r in filtered if r["stage"] in filter_stage]
+            with st.expander(label):
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Amount", row["amount"])
+                col2.metric("Stage", row["stage"])
+                col3.metric("Sector", row["sector"])
+                col4.metric("Date", row.get("date", "N/A"))
+                st.markdown(f"**Reason:** {row['reason']}")
 
-    st.markdown(f"### Showing {len(filtered)} startups")
-
-    tab1, tab2 = st.tabs(["📋 Cards", "📊 Table"])
-
-    with tab1:
-        for r in filtered:
-            render_card(r)
-
-    with tab2:
-        df = pd.DataFrame(filtered)
-        display_cols = ["company", "amount", "stage", "sector", "fit_score", "action", "reason"]
-        st.dataframe(df[[c for c in display_cols if c in df.columns]], use_container_width=True)
-
-else:
-    st.info("Click **Run Pipeline** to scan for funding signals.")
+    except Exception as e:
+        status.error(f"Error: {str(e)}")
+        st.exception(e)
