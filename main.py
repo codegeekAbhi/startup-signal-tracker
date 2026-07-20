@@ -206,6 +206,13 @@ Return this exact JSON structure:
 
 # ── Step 2: Score PM fit ───────────────────────────────────────────────────────
 def score_pm_fit(client, info, entry):
+    company  = info.get("company", "Unknown")
+    amount   = info.get("amount", "Unknown")
+    stage    = info.get("stage", "Unknown")
+    sector   = info.get("sector", "Unknown")
+    hq       = info.get("hq", "Unknown")
+    headline = entry.get("title", "")
+
     prompt = f"""You are a Senior PM with 8 years of experience evaluating startup outreach opportunities.
 Score this startup strictly and honestly for a Senior PM role fit.
 
@@ -214,12 +221,12 @@ Scoring guide:
 - 5-7:  Series B/C or unclear sector, moderate signal -> "monitor"
 - 1-4:  Late stage, non-tech sector, or weak signal -> "skip"
 
-Startup: {info['company']}
-Amount: {info['amount']}
-Stage: {info['stage']}
-Sector: {info['sector']}
-HQ: {info['hq']}
-Headline: {entry['title']}
+Startup: {company}
+Amount: {amount}
+Stage: {stage}
+Sector: {sector}
+HQ: {hq}
+Headline: {headline}
 
 Return ONLY valid JSON. No markdown, no explanation.
 {{
