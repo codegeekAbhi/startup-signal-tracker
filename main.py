@@ -1,456 +1,469 @@
-# ============================================
-# Startup Signal Tracker - CrewAI Pipeline
-# Phase 1: RSS Fetch - Extract - Score
-# ============================================
-
-import os
+import streamlit as st
+import feedparser
 import json
 import re
-import threading
-import email.utils
-import litellm
-import feedparser
+import time
+import requests
 import pandas as pd
+from datetime import datetime, timedelta
+from groq import Groq
 import gspread
-import streamlit as st
-
-from datetime import datetime, timezone, timedelta
 from google.oauth2.service_account import Credentials
-from crewai import Agent, Task, Crew, Process, LLM
 
-
-# ============================================
-# CONFIG
-# ============================================
-
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GOOGLE_CREDS = os.environ.get("GOOGLE_CREDS", "")
-SHEET_NAME = "Startup Signal Tracker"
-
-RSS_FEEDS = {
-    "TechCrunch Venture": "https://techcrunch.com/category/venture/feed/",
-    "TechCrunch Startups": "https://techcrunch.com/category/startups/feed/",
-    "VentureBeat": "https://venturebeat.com/feed/",
-}
-
-FUNDING_KEYWORDS = [
-    "raises", "raised", "funding", "seed", "series a", "series b",
-    "backed", "million", "launches", "announces"
-]
-
-EXCLUDE_PHRASES = [
-    "applications close", "third fund", "closed a fund",
-    "retail venture ipo", "doubles valuation", "disrupt 2026",
-    "50% off", "get ready for", "hottest place", "nvidia has",
-    "google's new", "google says", "google just", "google unveils",
-    "openai co-founder", "anthropic warns", "apple unveils",
-    "stage at techcrunch",
-]
-
-
-# ============================================
-# LLM SETUP
-# ============================================
-
-os.environ["LITELLM_CACHE"] = "False"
-os.environ["LITELLM_ENABLE_CACHING"] = "False"
-os.environ["GROQ_CACHE"] = "False"
-litellm.cache = None
-litellm.caching = False
-
-llm = LLM(
-    model="llama-3.3-70b-versatile",
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
+# ── Page config ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Startup Signal Tracker",
+    page_icon="🚀",
+    layout="wide",
 )
 
+# ── Styling ────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=DM+Sans:wght@400;500&display=swap');
 
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
+    html, body, [class*="css"] {
+        font-family: 'DM Sans', sans-serif;
+    }
+    h1, h2, h3 {
+        font-family: 'Playfair Display', serif;
+    }
+    .main { background-color: #f0f4ff; }
+    section[data-testid="stSidebar"] { background-color: #1d3a8a; color: white; }
+    section[data-testid="stSidebar"] * { color: white !important; }
 
-def parse_date(date_str):
+    .card {
+        background: white;
+        border-radius: 12px;
+        padding: 1.2rem 1.5rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+        border-left: 5px solid #ccc;
+    }
+    .card.green  { border-left-color: #22c55e; }
+    .card.yellow { border-left-color: #f59e0b; }
+    .card.red    { border-left-color: #ef4444; }
+
+    .badge {
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin-right: 6px;
+    }
+    .badge-green  { background: #dcfce7; color: #166534; }
+    .badge-yellow { background: #fef9c3; color: #854d0e; }
+    .badge-red    { background: #fee2e2; color: #991b1b; }
+    .badge-blue   { background: #dbeafe; color: #1e40af; }
+    .badge-gray   { background: #f3f4f6; color: #374151; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── RSS Feed Sources ───────────────────────────────────────────────────────────
+RSS_FEEDS = [
+    # TechCrunch
+    ("TechCrunch Venture",   "https://techcrunch.com/category/venture/feed/"),
+    ("TechCrunch Startups",  "https://techcrunch.com/startups/feed/"),
+    # VentureBeat
+    ("VentureBeat",          "https://venturebeat.com/feed/"),
+    # Crunchbase News
+    ("Crunchbase News",      "https://news.crunchbase.com/feed/"),
+    # Sifted (European startups)
+    ("Sifted",               "https://sifted.eu/feed/"),
+    # The Information (funding focused)
+    ("StrictlyVC",           "https://strictlyvc.com/feed/"),
+]
+
+STRONG_KEYWORDS = [
+    "funding", "raises", "raised", "seed", "series a", "series b", "series c",
+    "venture", "investment", "backed", "million", "billion", "round", "valuation",
+    "pre-seed", "growth round", "led by", "announces",
+]
+WEAK_KEYWORDS = [
+    "startup", "founded", "launch", "growth", "expansion",
+    "AI", "SaaS", "fintech", "healthtech", "B2B", "platform",
+]
+BLOCKLIST = [
+    "career", "job", "hiring", "podcast", "event", "webinar",
+    "obituary", "opinion", "review", "how to", "tutorial",
+    "layoff", "acqui-hire", "bankruptcy", "shutdown",
+]
+
+DAYS_WINDOW = 7
+
+# ── Jina AI Reader ─────────────────────────────────────────────────────────────
+def fetch_article_content(url: str) -> str:
+    """Use Jina AI Reader to get clean article text. Free, no API key needed."""
     try:
-        return email.utils.parsedate_to_datetime(date_str).replace(tzinfo=timezone.utc)
+        jina_url = f"https://r.jina.ai/{url}"
+        headers = {"Accept": "text/plain"}
+        resp = requests.get(jina_url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            # Cap at 800 chars to keep LLM context tight
+            return resp.text[:800]
     except Exception:
-        return None
+        pass
+    return ""
 
+# ── RSS Fetch ──────────────────────────────────────────────────────────────────
+def fetch_rss_entries():
+    cutoff = datetime.utcnow() - timedelta(days=DAYS_WINDOW)
+    seen_titles = set()
+    entries = []
 
-def has_funding_signal(title):
-    t = title.lower()
-    return any(kw in t for kw in FUNDING_KEYWORDS)
-
-
-def not_noise(title):
-    t = title.lower()
-    return not any(phrase in t for phrase in EXCLUDE_PHRASES)
-
-
-def fetch_and_filter_rss():
-    raw_entries = []
-    for source, url in RSS_FEEDS.items():
-        feed = feedparser.parse(url)
-        for entry in feed.entries:
-            raw_entries.append({
-                "source": source,
-                "title": entry.get("title", ""),
-                "link": entry.get("link", ""),
-                "summary": entry.get("summary", ""),
-                "published": entry.get("published", ""),
-            })
-
-    df = pd.DataFrame(raw_entries)
-    df = df.drop_duplicates(subset="title")
-    df["parsed_date"] = df["published"].apply(parse_date)
-
-    now = datetime.now(timezone.utc)
-    first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    first_of_last_month = (first_of_this_month - timedelta(days=1)).replace(day=1)
-
-    df = df[df["parsed_date"].notna() & (df["parsed_date"] >= first_of_last_month)]
-    df = df[df["title"].apply(has_funding_signal)]
-    df = df[df["title"].apply(not_noise)]
-    df = df.sort_values("parsed_date", ascending=False).reset_index(drop=True)
-    df["date"] = df["parsed_date"].dt.strftime("%Y-%m-%d")
-
-    return df, first_of_last_month, now
-
-
-def build_agents():
-    scout = Agent(
-        role="Startup Signal Scout",
-        goal="Fetch RSS feeds, filter for recently funded startups, return clean deduplicated entries from the current and last month.",
-        backstory="Expert at monitoring startup news, spotting genuine funding announcements and filtering noise.",
-        llm=llm,
-        verbose=False,
-        allow_delegation=False
-    )
-
-    researcher = Agent(
-        role="Startup Data Researcher",
-        goal=(
-            "Extract precise structured data from each startup funding entry. "
-            "You must extract the EXACT company name as written in the headline, not a description. "
-            "Also extract investor/VC names and any founder, CEO, or CTO names mentioned."
-        ),
-        backstory=(
-            "You are a precise data extractor who reads startup funding headlines carefully. "
-            "You never replace a company name with a generic description. "
-            "If the headline says 'Acme raises $10M', the company is Acme, not 'a startup'. "
-            "You also identify which VC firms or investors backed the round, and any key people mentioned."
-        ),
-        llm=llm,
-        verbose=False,
-        allow_delegation=False
-    )
-
-    analyst = Agent(
-        role="PM Fit Analyst",
-        goal="Score each startup 1-10 for PM fit and recommend: reach out now, monitor, or skip.",
-        backstory=(
-            "Evaluates startups for a senior PM candidate: 7+ years at Amazon/Deloitte/TCS, "
-            "B2B SaaS and AI experience, MBA UC Davis 2026, targeting Series A/B. "
-            "Low fit for Hardware and consumer social."
-        ),
-        llm=llm,
-        verbose=False,
-        allow_delegation=False
-    )
-
-    return scout, researcher, analyst
-
-
-def build_tasks(scout, researcher, analyst):
-    scout_task = Task(
-        description=(
-            "Fetch RSS feeds from:\n"
-            "- https://techcrunch.com/feed/\n"
-            "- https://techcrunch.com/category/startups/feed/\n"
-            "- https://venturebeat.com/feed/\n\n"
-            "Filter by funding keywords, current month and last month, deduplicate, exclude noise. "
-            "Return each entry with: title (exact headline text), summary, published date, and link. "
-            "Sort entries by published date, newest first. "
-            "Do NOT paraphrase or rewrite the title. Return it exactly as published."
-        ),
-        expected_output="List of dicts with title (exact), summary, published, link sorted by date descending",
-        agent=scout
-    )
-
-    researcher_task = Task(
-        description=(
-            "You will receive a list of startup funding headlines and summaries from the Scout. "
-            "For each entry extract the following fields:\n\n"
-            "- company: the EXACT startup name from the headline. "
-            "For example if the title is 'Acme AI raises $17M Series A', company is 'Acme AI'. "
-            "NEVER use generic descriptions like 'AI startup' or 'mental health platform' as the company name.\n"
-            "- amount: funding amount with $ sign, e.g. '$17M'. Use 'Unknown' if not stated.\n"
-            "- stage: Seed, Series A, Series B, etc. Use 'Unknown' if not stated.\n"
-            "- sector: industry sector, e.g. AI, FinTech, LegalTech, SaaS, HealthTech. Use 'Unknown' if unclear.\n"
-            "- investors: names of VC firms or investors mentioned, e.g. 'a16z, YC'. Use 'Not mentioned' if none.\n"
-            "- key_people: names and roles of founders, CEOs, CTOs mentioned, e.g. 'Jane Smith (CEO)'. Use 'Not mentioned' if none.\n"
-            "- date: published date in YYYY-MM-DD format.\n"
-            "- is_startup: true if this is a startup raise, false if it is a VC fund or large enterprise.\n\n"
-            "Return only entries where is_startup is true."
-        ),
-        expected_output=(
-            "List of dicts with company (exact name), amount, stage, sector, "
-            "investors, key_people, date, title, link"
-        ),
-        agent=researcher,
-        context=[scout_task]
-    )
-
-    analyst_task = Task(
-        description=(
-            "You will receive a list of structured startup entries from the Researcher. "
-            "Score each startup 1-10 for PM fit based on this candidate profile:\n"
-            "- 7+ years at Amazon, Deloitte, TCS\n"
-            "- Strong in B2B SaaS, marketplace, AI-powered products\n"
-            "- MBA UC Davis 2026\n"
-            "- Targeting Series A and Series B\n"
-            "- Low interest in Hardware and pure consumer social\n\n"
-            "For each startup return these fields:\n"
-            "- company: copy EXACT company name from Researcher output, never use a generic description\n"
-            "- amount: copy exactly from Researcher\n"
-            "- stage: copy exactly from Researcher\n"
-            "- sector: copy exactly from Researcher\n"
-            "- investors: copy exactly from Researcher\n"
-            "- key_people: copy exactly from Researcher\n"
-            "- date: copy exactly from Researcher\n"
-            "- fit_score: integer 1-10\n"
-            "- reason: one sentence explaining the score\n"
-            "- action: one of 'reach out now' (8-10), 'monitor' (5-7), 'skip' (1-4)\n\n"
-            "Return ONLY a valid JSON array. No explanation, no markdown, no code blocks. "
-            "Sort by date descending, then fit_score descending within the same date.\n"
-            "Example:\n"
-            '[{"company": "Status AI", "amount": "$17M", "stage": "Series A", "sector": "AI", '
-            '"investors": "a16z, YC", "key_people": "Jane Smith (CEO)", "date": "2026-05-20", '
-            '"fit_score": 9, "reason": "Strong AI B2B fit at Series A.", "action": "reach out now"}]'
-        ),
-        expected_output="Valid JSON array sorted by date desc then fit_score desc",
-        agent=analyst,
-        context=[researcher_task]
-    )
-
-    return scout_task, researcher_task, analyst_task
-
-
-def run_crew(scout_task, researcher_task, analyst_task, scout, researcher, analyst):
-    crew = Crew(
-        agents=[scout, researcher, analyst],
-        tasks=[scout_task, researcher_task, analyst_task],
-        process=Process.sequential,
-        verbose=False
-    )
-
-    result_container = {}
-
-    def kickoff():
-        result_container["result"] = crew.kickoff()
-
-    thread = threading.Thread(target=kickoff)
-    thread.start()
-    thread.join(timeout=300)
-
-    return result_container.get("result", None)
-
-
-def parse_result(result):
-    raw = str(result)
-    match = re.search(r'\[.*\]', raw, re.DOTALL)
-
-    if not match:
-        return None, raw
-
-    json_str = match.group(0)
-    json_str = re.sub(r',\s*}', '}', json_str)
-    json_str = re.sub(r',\s*]', ']', json_str)
-    json_str = re.sub(r'[\x00-\x1f\x7f]', ' ', json_str)
-    json_str = json_str.replace('\u201c', '"').replace('\u201d', '"')
-    json_str = json_str.replace('\u2018', "'").replace('\u2019', "'")
-
-    data = None
-
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError:
-        objects = re.findall(r'\{[^{}]+\}', json_str, re.DOTALL)
-        data = []
-        for obj in objects:
-            try:
-                parsed = json.loads(obj)
-                data.append(parsed)
-            except json.JSONDecodeError:
-                obj_clean = re.sub(
-                    r'("reason"\s*:\s*")(.*?)("(?:\s*,|\s*}))',
-                    lambda m: m.group(1) + m.group(2).replace('"', "'") + m.group(3),
-                    obj,
-                    flags=re.DOTALL
-                )
-                try:
-                    parsed = json.loads(obj_clean)
-                    data.append(parsed)
-                except json.JSONDecodeError:
+    for source_name, url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            for e in feed.entries:
+                title = e.get("title", "").strip()
+                if not title or title in seen_titles:
                     continue
 
-    if not data:
-        return None, f"Could not parse any valid entries.\n\nRaw:\n{raw}"
+                title_lower = title.lower()
 
-    df_final = pd.DataFrame(data)
+                # Blocklist check
+                if any(b in title_lower for b in BLOCKLIST):
+                    continue
 
-    if "date" in df_final.columns:
-        df_final["date"] = pd.to_datetime(df_final["date"], errors="coerce")
-        df_final = df_final.sort_values(
-            ["date", "fit_score"],
-            ascending=[False, False]
-        ).reset_index(drop=True)
-        df_final["date"] = df_final["date"].dt.strftime("%Y-%m-%d")
-    else:
-        df_final = df_final.sort_values("fit_score", ascending=False).reset_index(drop=True)
+                # Date filter
+                published = e.get("published_parsed") or e.get("updated_parsed")
+                if published:
+                    pub_dt = datetime(*published[:6])
+                    if pub_dt < cutoff:
+                        continue
 
-    return df_final, None
+                # Keyword filter — title only
+                strong_hit = any(k in title_lower for k in STRONG_KEYWORDS)
+                weak_hits  = sum(1 for k in WEAK_KEYWORDS if k in title_lower)
+                if not strong_hit and weak_hits < 2:
+                    continue
 
+                seen_titles.add(title)
+                entries.append({
+                    "title":   title,
+                    "summary": (e.get("summary", "") or "")[:300],
+                    "link":    e.get("link", ""),
+                    "source":  source_name,
+                    "published": published,
+                })
+        except Exception:
+            continue
 
-def export_to_sheets(df_final):
-    if not GOOGLE_CREDS:
-        return False, "GOOGLE_CREDS secret not set."
+    # Sort by publish date descending (newest first)
+    entries.sort(
+        key=lambda x: x["published"] if x["published"] else (2000,1,1,0,0,0),
+        reverse=True
+    )
+    return entries
+
+# ── Groq client ────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_groq_client():
+    return Groq(api_key=st.secrets["GROQ_API_KEY"])
+
+# ── Step 1: Extract startup info ───────────────────────────────────────────────
+def extract_startup_info(client, entry, article_content=""):
+    context = f"""Title: {entry['title']}
+Summary: {entry['summary']}"""
+    if article_content:
+        context += f"\nArticle excerpt: {article_content}"
+
+    prompt = f"""Extract startup funding information from this article.
+Return ONLY valid JSON. No markdown, no explanation.
+
+{context}
+
+Return this exact JSON structure:
+{{
+  "company": "company name or Unknown",
+  "amount": "funding amount with currency or Unknown",
+  "stage": "Pre-seed/Seed/Series A/Series B/Series C/Growth/Unknown",
+  "sector": "industry sector in 2-3 words",
+  "key_people": "founder or CEO name if mentioned, else Unknown",
+  "hq": "city, country if mentioned, else Unknown"
+}}"""
 
     try:
-        creds_data = json.loads(GOOGLE_CREDS)
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.1,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
+        return json.loads(raw)
+    except Exception:
+        return {
+            "company":    "Unknown",
+            "amount":     "Unknown",
+            "stage":      "Unknown",
+            "sector":     "Unknown",
+            "key_people": "Unknown",
+            "hq":         "Unknown",
+        }
+
+# ── Step 2: Score PM fit ───────────────────────────────────────────────────────
+def score_pm_fit(client, info, entry):
+    prompt = f"""You are a Senior PM with 8 years of experience evaluating startup outreach opportunities.
+Score this startup strictly and honestly for a Senior PM role fit.
+
+Scoring guide:
+- 8-10: Early stage (Seed/Series A), AI/SaaS/B2B/Fintech sector, strong signal -> "reach out now"
+- 5-7:  Series B/C or unclear sector, moderate signal -> "monitor"
+- 1-4:  Late stage, non-tech sector, or weak signal -> "skip"
+
+Startup: {info['company']}
+Amount: {info['amount']}
+Stage: {info['stage']}
+Sector: {info['sector']}
+HQ: {info['hq']}
+Headline: {entry['title']}
+
+Return ONLY valid JSON. No markdown, no explanation.
+{{
+  "fit_score": <integer 1-10>,
+  "action": "reach out now / monitor / skip",
+  "reason": "one specific sentence explaining the score"
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.2,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
+        return json.loads(raw)
+    except Exception:
+        return {
+            "fit_score": 5,
+            "action":    "monitor",
+            "reason":    "Could not score automatically.",
+        }
+
+# ── Google Sheets export ───────────────────────────────────────────────────────
+def export_to_sheets(df):
+    try:
+        creds_dict = json.loads(st.secrets["GOOGLE_CREDS"])
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
+            "https://www.googleapis.com/auth/drive",
         ]
-        creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
-        client = gspread.authorize(creds)
-        sheet = client.open(SHEET_NAME).sheet1
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc    = gspread.authorize(creds)
+        sh    = gc.open("Startup Signal Tracker")
+        ws    = sh.sheet1
 
-        headers = [
-            "run_timestamp", "date", "company", "amount", "stage",
-            "sector", "investors", "key_people", "fit_score", "action", "reason"
-        ]
-        existing = sheet.get_all_values()
-        if len(existing) == 0:
-            sheet.append_row(headers)
-
-        run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        for _, row in df_final.iterrows():
-            sheet.append_row([
-                run_time,
-                row.get("date", "Unknown"),
-                row.get("company", "Unknown"),
-                row.get("amount", "Unknown"),
-                row.get("stage", "Unknown"),
-                row.get("sector", "Unknown"),
-                row.get("investors", "Not mentioned"),
-                row.get("key_people", "Not mentioned"),
-                int(row.get("fit_score", 0)),
-                row.get("action", "skip"),
-                row.get("reason", "")
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        for _, row in df.iterrows():
+            ws.append_row([
+                timestamp,
+                row.get("company", ""),
+                row.get("amount", ""),
+                row.get("stage", ""),
+                row.get("sector", ""),
+                row.get("hq", ""),
+                row.get("fit_score", ""),
+                row.get("action", ""),
+                row.get("reason", ""),
+                row.get("key_people", ""),
+                row.get("source", ""),
+                row.get("link", ""),
             ])
-
-        return True, f"{len(df_final)} rows written at {run_time}"
-
+        return True
     except Exception as e:
-        return False, str(e)
+        st.warning(f"Google Sheets export failed: {e}")
+        return False
 
+# ── Run pipeline ───────────────────────────────────────────────────────────────
+def run_pipeline(use_jina: bool = False):
+    client  = get_groq_client()
+    results = []
 
-# ============================================
-# STREAMLIT UI
-# ============================================
+    with st.status("🔍 Scanning RSS feeds...", expanded=True) as status:
+        entries = fetch_rss_entries()
+        st.write(f"Found **{len(entries)}** articles matching funding signals in last {DAYS_WINDOW} days")
 
-st.set_page_config(page_title="Startup Signal Tracker", page_icon="rocket", layout="wide")
-st.title("Startup Signal Tracker")
-st.markdown("Multi-agent pipeline: RSS - Extract - Score PM Fit - Google Sheets")
+        if not entries:
+            status.update(label="No articles found. Try again later.", state="error")
+            return []
 
-st.sidebar.header("Configuration")
-st.sidebar.markdown("**Candidate Profile**")
-st.sidebar.markdown("**Abhishek Singh**")
-st.sidebar.markdown(
-    "[LinkedIn](https://www.linkedin.com/in/abhishek-singh-davis) | "
-    "[GitHub](https://github.com/codegeekAbhi) | "
-    "[Portfolio](https://www.notion.so/Hi-I-m-Abhishek-Singh-21b6d321e30b804eab8ad37f2783be09)"
-)
-st.sidebar.markdown("---")
-st.sidebar.markdown("- 7+ years: Amazon, Deloitte, TCS")
-st.sidebar.markdown("- B2B SaaS, AI, Marketplace")
-st.sidebar.markdown("- MBA UC Davis 2026")
-st.sidebar.markdown("- Target: Series A/B")
-st.sidebar.markdown("- Date range: current month + last month")
+        status.update(label="🤖 Extracting and scoring startups...")
+        progress = st.progress(0)
 
-run_button = st.sidebar.button("Run Signal Tracker", type="primary")
+        for i, entry in enumerate(entries):
+            # Optionally enrich with Jina
+            article_content = ""
+            if use_jina and entry.get("link"):
+                article_content = fetch_article_content(entry["link"])
+                time.sleep(0.3)
 
-status = st.empty()
-progress = st.progress(0)
+            # Extract
+            info = extract_startup_info(client, entry, article_content)
+            time.sleep(0.5)
 
-if run_button:
-    try:
-        status.info("Setting up agents...")
-        progress.progress(10)
+            # Score
+            score = score_pm_fit(client, info, entry)
+            time.sleep(0.5)
 
-        scout, researcher, analyst = build_agents()
-        scout_task, researcher_task, analyst_task = build_tasks(scout, researcher, analyst)
+            # Skip truly unknown companies
+            if info.get("company", "Unknown") == "Unknown":
+                progress.progress((i + 1) / len(entries))
+                continue
 
-        status.info("Running agents... this takes 2-3 minutes")
-        progress.progress(30)
+            results.append({
+                "company":    info.get("company", "Unknown"),
+                "amount":     info.get("amount", "Unknown"),
+                "stage":      info.get("stage", "Unknown"),
+                "sector":     info.get("sector", "Unknown"),
+                "hq":         info.get("hq", "Unknown"),
+                "key_people": info.get("key_people", "Unknown"),
+                "fit_score":  score.get("fit_score", 5),
+                "action":     score.get("action", "monitor"),
+                "reason":     score.get("reason", ""),
+                "source":     entry.get("source", ""),
+                "link":       entry.get("link", ""),
+                "title":      entry.get("title", ""),
+            })
+            progress.progress((i + 1) / len(entries))
 
-        result = run_crew(scout_task, researcher_task, analyst_task, scout, researcher, analyst)
+        status.update(label=f"Done — {len(results)} startups scored", state="complete")
 
-        if result is None:
-            status.error("Crew timed out or failed. Try again.")
-            st.stop()
+    return sorted(results, key=lambda x: x["fit_score"], reverse=True)
 
-        progress.progress(70)
+# ── UI helpers ─────────────────────────────────────────────────────────────────
+def action_badge(action):
+    action = (action or "").lower()
+    if "reach" in action:
+        return '<span class="badge badge-green">🟢 Reach Out Now</span>', "green"
+    elif "monitor" in action:
+        return '<span class="badge badge-yellow">🟡 Monitor</span>', "yellow"
+    else:
+        return '<span class="badge badge-red">🔴 Skip</span>', "red"
 
-        df_final, error = parse_result(result)
+def render_card(r):
+    badge_html, color = action_badge(r["action"])
+    score = r.get("fit_score", 5)
+    hq    = r.get("hq", "Unknown")
+    source = r.get("source", "")
+    st.markdown(f"""
+    <div class="card {color}">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <h3 style="margin:0; font-size:1.1rem;">{r['company']}</h3>
+            {badge_html}
+            <span class="badge badge-blue">Fit Score: {score}/10</span>
+        </div>
+        <div style="margin-top:0.6rem; display:flex; flex-wrap:wrap; gap:6px;">
+            <span class="badge badge-gray">💰 {r['amount']}</span>
+            <span class="badge badge-gray">📊 {r['stage']}</span>
+            <span class="badge badge-gray">🏭 {r['sector']}</span>
+            <span class="badge badge-gray">📍 {hq}</span>
+            <span class="badge badge-gray">👤 {r['key_people']}</span>
+            <span class="badge badge-gray">📰 {source}</span>
+        </div>
+        <p style="margin:0.6rem 0 0.3rem; font-size:0.9rem; color:#374151;">{r['reason']}</p>
+        <a href="{r['link']}" target="_blank" style="font-size:0.8rem; color:#1d3a8a;">🔗 {r['title'][:90]}...</a>
+    </div>
+    """, unsafe_allow_html=True)
 
-        if df_final is None:
-            status.warning("Could not parse results. Raw output below:")
-            st.text(error)
-            st.stop()
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🚀 Startup Signal Tracker")
+    st.markdown("Monitors funding news and ranks startups by PM fit.")
+    st.markdown("---")
+    st.markdown("**Settings**")
+    use_jina = st.toggle(
+        "Deep article scan (Jina AI)",
+        value=False,
+        help="Fetches full article content for richer extraction. Slower but more accurate."
+    )
+    st.markdown("---")
+    st.markdown("**Filters**")
+    filter_action = st.multiselect(
+        "Action",
+        ["reach out now", "monitor", "skip"],
+        default=["reach out now", "monitor"],
+    )
+    filter_stage = st.multiselect(
+        "Stage",
+        ["Pre-seed", "Seed", "Series A", "Series B", "Series C", "Growth", "Unknown"],
+        default=[],
+    )
+    filter_source = st.multiselect(
+        "Source",
+        [name for name, _ in RSS_FEEDS],
+        default=[],
+    )
+    st.markdown("---")
+    st.markdown("**Sources**")
+    for name, url in RSS_FEEDS:
+        domain = url.split("/")[2].replace("www.", "")
+        st.markdown(f"• {name} ({domain})")
 
-        status.info("Writing to Google Sheets...")
-        progress.progress(85)
+# ── Main ───────────────────────────────────────────────────────────────────────
+st.markdown("# 🚀 Startup Signal Tracker")
+st.markdown(f"Live funding signals from {len(RSS_FEEDS)} sources, last {DAYS_WINDOW} days only")
 
-        success, msg = export_to_sheets(df_final)
-        if success:
-            st.sidebar.success(msg)
-        else:
-            st.sidebar.warning(f"Sheets export skipped: {msg}")
+col1, col2, col3 = st.columns([1, 1, 2])
+with col1:
+    run_btn = st.button("▶ Run Pipeline", type="primary", use_container_width=True)
+with col2:
+    sheets_btn = st.button("📊 Export to Sheets", use_container_width=True)
 
-        progress.progress(100)
-        status.success(f"Done! {len(df_final)} startups ranked.")
+if run_btn:
+    results = run_pipeline(use_jina=use_jina)
+    st.session_state["results"] = results
+    st.session_state["run_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-        st.subheader("Ranked Startup List")
+    if results:
+        reach   = sum(1 for r in results if "reach"   in r["action"].lower())
+        monitor = sum(1 for r in results if "monitor" in r["action"].lower())
+        skip    = sum(1 for r in results if "skip"    in r["action"].lower())
 
-        for _, row in df_final.iterrows():
-            action = row.get("action", "skip")
-            if action == "reach out now":
-                icon = "HIGH"
-            elif action == "monitor":
-                icon = "MED"
-            else:
-                icon = "LOW"
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Startups", len(results))
+        m2.metric("🟢 Reach Out Now", reach)
+        m3.metric("🟡 Monitor", monitor)
+        m4.metric("🔴 Skip", skip)
 
-            label = (
-                f"[{icon}] {row.get('date', 'N/A')} - "
-                f"{row.get('company', 'Unknown')} - "
-                f"Score: {row.get('fit_score', 0)}/10 - "
-                f"{action.upper()}"
-            )
+results  = st.session_state.get("results", [])
+run_time = st.session_state.get("run_time", "")
 
-            with st.expander(label):
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Amount", row.get("amount", "Unknown"))
-                col2.metric("Stage", row.get("stage", "Unknown"))
-                col3.metric("Sector", row.get("sector", "Unknown"))
-                col4.metric("Date", row.get("date", "N/A"))
+if sheets_btn and results:
+    df = pd.DataFrame(results)
+    ok = export_to_sheets(df)
+    if ok:
+        st.success("Exported to Google Sheets")
 
-                st.markdown(f"**Investors / VC:** {row.get('investors', 'Not mentioned')}")
-                st.markdown(f"**Key People:** {row.get('key_people', 'Not mentioned')}")
-                st.markdown(f"**Reason:** {row.get('reason', '')}")
+if results:
+    if run_time:
+        st.caption(f"Last run: {run_time}")
 
-    except Exception as e:
-        status.error(f"Error: {str(e)}")
-        st.exception(e)
+    # Apply filters
+    filtered = results
+    if filter_action:
+        filtered = [r for r in filtered if any(a in r["action"].lower() for a in filter_action)]
+    if filter_stage:
+        filtered = [r for r in filtered if r["stage"] in filter_stage]
+    if filter_source:
+        filtered = [r for r in filtered if r["source"] in filter_source]
+
+    st.markdown(f"### Showing {len(filtered)} startups")
+
+    tab1, tab2 = st.tabs(["📋 Cards", "📊 Table"])
+
+    with tab1:
+        for r in filtered:
+            render_card(r)
+
+    with tab2:
+        df = pd.DataFrame(filtered)
+        display_cols = ["company", "amount", "stage", "sector", "hq", "fit_score", "action", "reason", "source"]
+        st.dataframe(df[[c for c in display_cols if c in df.columns]], use_container_width=True)
+
+else:
+    st.info("Click **Run Pipeline** to scan for funding signals.")
