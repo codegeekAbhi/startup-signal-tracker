@@ -193,7 +193,10 @@ Return this exact JSON structure:
         )
         raw = response.choices[0].message.content.strip()
         raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
-        return json.loads(raw)
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise ValueError("LLM returned non-dict")
+        return result
     except Exception:
         return {
             "company":    "Unknown",
@@ -312,9 +315,15 @@ def run_pipeline(use_jina: bool = False):
             # Extract
             info = extract_startup_info(client, entry, article_content)
             time.sleep(0.5)
+            if not isinstance(info, dict):
+                progress.progress((i + 1) / len(entries))
+                continue
 
             # Score
-            score = score_pm_fit(client, info, entry)
+            try:
+                score = score_pm_fit(client, info, entry)
+            except Exception:
+                score = {"fit_score": 5, "action": "monitor", "reason": "Could not score."}
             time.sleep(0.5)
 
             # Skip truly unknown companies
@@ -379,6 +388,10 @@ def render_card(r):
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.markdown("## Abhishek Singh")
+    st.markdown("Senior PM | AI Products | MBA UC Davis 2026")
+    st.markdown("[LinkedIn](https://www.linkedin.com/in/abhisheksingh-pm) | [Portfolio](https://notion.so)")
+    st.markdown("---")
     st.markdown("## 🚀 Startup Signal Tracker")
     st.markdown("Monitors funding news and ranks startups by PM fit.")
     st.markdown("---")
