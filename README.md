@@ -1,4 +1,4 @@
-# 🚀 Startup Signal Tracker
+# Startup Signal Tracker
 
 AI-powered pipeline that monitors RSS feeds for newly funded startups and scores them for PM fit.
 
