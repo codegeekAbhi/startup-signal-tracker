@@ -3,8 +3,6 @@
 AI-powered pipeline that monitors RSS feeds for newly funded startups and scores them for PM fit.
 
 ## Live App
-https://streamlit-blank--ahmsingh.replit.app
-
 https://startup-signal-tracker.streamlit.app/
 
 ## Stack
