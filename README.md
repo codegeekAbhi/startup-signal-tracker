@@ -3,7 +3,8 @@
 AI-powered pipeline that monitors RSS feeds for newly funded startups and scores them for PM fit.
 
 ## Live App
-https://startup-signal-tracker.streamlit.app/
+Streamlit Link : https://startup-signal-tracker.streamlit.app/
+Replit Link : https://streamlit-blank--ahmsingh.replit.app/
 
 ## Stack
 - CrewAI — multi-agent orchestration
