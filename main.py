@@ -925,26 +925,27 @@ def run_pipeline(use_jina=False):
         # ---------------------------------------------------------------------
 
         if error_messages:
-
-            with st.expander(
-                "⚠️ View Groq errors"
-            ):
-
-                for error_item in error_messages:
-
-                    st.markdown(
-                        f"**{error_item['title']}**"
-                    )
-
-                    st.caption(
-                        error_item["source"]
-                    )
-
-                    st.code(
-                        error_item["error"]
-                    )
-
-                    st.markdown("---")
+        
+            st.warning(
+                f"Groq encountered {len(error_messages)} error(s). "
+                "Error details are shown below."
+            )
+        
+            for error_item in error_messages:
+        
+                st.markdown(
+                    f"**Article:** {error_item['title']}"
+                )
+        
+                st.caption(
+                    f"Source: {error_item['source']}"
+                )
+        
+                st.code(
+                    error_item["error"]
+                )
+        
+                st.markdown("---")
 
         # ---------------------------------------------------------------------
         # Final status
